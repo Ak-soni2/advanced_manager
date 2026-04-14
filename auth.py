@@ -14,10 +14,12 @@ def login(username: str, password: str) -> dict | None:
         .select("*")
         .eq("username", username)
         .eq("password_hash", _hash(password))
-        .maybe_single()
+        .limit(1)
         .execute()
     )
-    return result.data if result.data else None
+    if not result.data:
+        return None
+    return result.data[0] if isinstance(result.data, list) else result.data
 
 def signup(username: str, password: str, github_handle: str) -> bool:
     try:
@@ -75,8 +77,8 @@ def get_all_users() -> list[dict]:
 
 def require_login() -> dict:
     if not st.session_state.get("user"):
-        st.title("🎤 Automated Task Manager")
-        st.caption("Meeting transcripts → AI task extraction → Team dashboard")
+        st.title("🟠 Automated Task Manager Manager OS")
+        st.caption("Meeting intelligence -> AI action planning -> Team execution")
         st.divider()
 
         tab_login, tab_signup = st.tabs(["🔑 Sign In", "📝 Create Account"])

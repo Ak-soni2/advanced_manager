@@ -16,6 +16,7 @@ from services.task_manager import (
     get_tasks_for_developer,
     get_stats_for_manager,
     get_stats_for_developer,
+    get_leaderboard_matrix,
     get_meetings,
     save_meeting,
     save_extracted_tasks,
@@ -28,16 +29,31 @@ from services.task_manager import (
     get_pending_tasks,
     manager_update_task,
 )
-from services.github_sync import create_github_issue
+from services.github_sync import create_github_issue, sync_github_issue_statuses
+from services.extractor import infer_task_status_from_note
 
-app = FastAPI(title="Automated Task Manager API", version="1.0.0")
+app = FastAPI(title="Automated Task Manager Manager OS API", version="1.0.0")
 
 # ── CORS ────────────────────────────────────────────────────────────────────
 FRONTEND_ORIGIN = os.getenv("FRONTEND_URL", "http://localhost:3000")
+EXTRA_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ADDITIONAL_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
+ALLOWED_ORIGINS = [
+    FRONTEND_ORIGIN,
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:8000",
+    "https://advanced-manager-ui.vercel.app",
+    "http://172.31.112.12:3000",
+    "http://172.31.112.12",
+    *EXTRA_ALLOWED_ORIGINS,
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000", "https://advanced-manager-ui.vercel.app"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +70,15 @@ class SignupRequest(BaseModel):
     username: str
     password: str
     github_handle: str
+
+class TaskUpdateRequest(BaseModel):
+    description: Optional[str] = None
+    priority: Optional[str] = None
+    deadline: Optional[str] = None
+    assigned_to: Optional[str] = None
+    assignees_list: Optional[List[str]] = None
+    manager_notes: Optional[str] = None
+    status: Optional[str] = None
 
 class ConfirmTaskRequest(BaseModel):
     assigned_to: str
@@ -90,6 +115,14 @@ class CreateDeveloperRequest(BaseModel):
     username: str
     github_handle: Optional[str] = None
 
+class AISuggestStatusRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class HelpQueryRequest(BaseModel):
+    question: str
+    mode: Optional[str] = "question"
+
 
 # ── Auth Helpers ─────────────────────────────────────────────────────────────
 
@@ -120,12 +153,12 @@ async def login(req: LoginRequest):
         .select("*")
         .eq("username", req.username)
         .eq("password_hash", _hash(req.password))
-        .maybe_single()
+        .limit(1)
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    user = result.data
+    user = result.data[0] if isinstance(result.data, list) else result.data
     return {
         "id": user["id"],
         "username": user["username"],
@@ -189,6 +222,16 @@ async def developer_stats(user_id: str, user=Depends(get_current_user)):
     return get_stats_for_developer(user_id)
 
 
+@app.get("/api/stats/leaderboard")
+async def leaderboard_stats(user=Depends(get_current_user)):
+    return get_leaderboard_matrix()
+
+
+@app.get("/api/leaderboard")
+async def leaderboard(user=Depends(get_current_user)):
+    return get_leaderboard_matrix()
+
+
 # ── Meeting Routes ────────────────────────────────────────────────────────────
 
 @app.get("/api/meetings")
@@ -220,14 +263,26 @@ async def pending_tasks(user=Depends(require_manager)):
 
 
 @app.get("/api/tasks/manager")
-async def all_tasks_manager(status: Optional[str] = None, user=Depends(require_manager)):
+async def all_tasks_manager(
+    status: Optional[str] = None,
+    meeting_id: Optional[str] = None,
+    user=Depends(require_manager),
+):
     status_filter = [status] if status else None
-    return get_all_tasks_for_manager(status_filter)
+    return get_all_tasks_for_manager(status_filter, meeting_id)
 
 
 @app.get("/api/tasks/developer/{user_id}")
 async def tasks_for_developer(user_id: str, user=Depends(get_current_user)):
     return get_tasks_for_developer(user_id)
+
+
+@app.put("/api/tasks/{task_id}")
+async def update_task_fully(task_id: str, req: TaskUpdateRequest, user=Depends(require_manager)):
+    """Full task update for managers."""
+    updates = req.dict(exclude_unset=True)
+    manager_update_task(task_id, updates)
+    return {"success": True}
 
 
 @app.post("/api/tasks/{task_id}/confirm")
@@ -265,6 +320,45 @@ async def append_note(task_id: str, req: AppendNoteRequest, user=Depends(get_cur
     return {"success": True}
 
 
+@app.post("/api/tasks/{task_id}/ai-suggest-status")
+async def ai_suggest_status(task_id: str, req: AISuggestStatusRequest, user=Depends(get_current_user)):
+    db = get_db()
+    result = (
+        db.table("tasks")
+        .select("id, assigned_to, assignees_list, status, manager_notes")
+        .eq("id", task_id)
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = result.data
+    is_manager = user.get("role") == "manager"
+    assignees = task.get("assignees_list") or []
+    is_assigned = user.get("id") == task.get("assigned_to") or user.get("id") in assignees
+    if not is_manager and not is_assigned:
+        raise HTTPException(status_code=403, detail="Not allowed for this task")
+
+    note = (req.note or "").strip()
+    if not note:
+        thread = parse_thread_history(task.get("manager_notes"))
+        if thread:
+            note = thread[-1].get("text", "").strip()
+
+    if not note:
+        raise HTTPException(status_code=400, detail="No thread note found to analyze")
+
+    current_status = task.get("status") or "confirmed"
+    suggested_status = infer_task_status_from_note(note, current_status)
+    return {
+        "current_status": current_status,
+        "suggested_status": suggested_status,
+        "changed": suggested_status != current_status,
+        "based_on_note": note,
+    }
+
+
 @app.get("/api/tasks/{task_id}/thread")
 async def get_thread(task_id: str, user=Depends(get_current_user)):
     db = get_db()
@@ -281,19 +375,146 @@ async def delete_task_route(task_id: str, user=Depends(require_manager)):
     return {"success": True}
 
 
+# ── AI Sidebar Assistant ─────────────────────────────────────────────────────
+
+@app.post("/api/help/query")
+async def help_query(req: HelpQueryRequest, user=Depends(get_current_user)):
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    mode = (req.mode or "question").strip().lower()
+    if mode not in ("question", "command"):
+        raise HTTPException(status_code=400, detail="Invalid mode")
+
+    # Lazily initialize services so startup is lightweight and fallback still works
+    from services.help_service import HelpService
+
+    agent = None
+    if os.getenv("HF_TOKEN"):
+        try:
+            from services.agent_service import AgentService
+            agent = AgentService(user=user)
+        except Exception:
+            agent = None
+
+    helper = HelpService(agent)
+    response = helper.get_response(question, mode=mode, user=user)
+    return {"response": response, "mode": mode}
+
+
 # ── GitHub Sync ───────────────────────────────────────────────────────────────
 
 @app.post("/api/tasks/{task_id}/github-sync")
-async def github_sync(task_id: str, req: GitHubSyncRequest, user=Depends(require_manager)):
+async def github_sync(task_id: str, req: GitHubSyncRequest, user=Depends(get_current_user)):
     db = get_db()
     result = db.table("tasks").select("*, meetings(title, attendees)").eq("id", task_id).maybe_single().execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Task not found")
     task = result.data
-    url = create_github_issue(task, req.assignee_github_handle)
+
+    is_manager = user.get("role") == "manager"
+    assignees = task.get("assignees_list") or []
+    is_assigned = user.get("id") == task.get("assigned_to") or user.get("id") in assignees
+    if not is_manager and not is_assigned:
+        raise HTTPException(status_code=403, detail="Not allowed for this task")
+
+    assignee_handle = req.assignee_github_handle
+    if not assignee_handle and task.get("assigned_to"):
+        assignee_user = (
+            db.table("users")
+            .select("github_handle")
+            .eq("id", task.get("assigned_to"))
+            .maybe_single()
+            .execute()
+        )
+        assignee_handle = (assignee_user.data or {}).get("github_handle")
+
+    url = create_github_issue(task, assignee_handle)
     if url and url.startswith("ERROR"):
         raise HTTPException(status_code=400, detail=url)
     return {"github_issue_url": url}
+
+
+@app.post("/api/tasks/github-sync-all")
+async def github_sync_all(user=Depends(require_manager)):
+    db = get_db()
+    tasks = get_all_tasks_for_manager()
+    created = 0
+    failed = 0
+    failed_details = []
+
+    for task in tasks:
+        if task.get("status") in ("rejected", "pending_review"):
+            continue
+        if task.get("github_issue_url"):
+            continue
+
+        assignee_handle = None
+        if task.get("assigned_to"):
+            assignee_user = (
+                db.table("users")
+                .select("github_handle")
+                .eq("id", task.get("assigned_to"))
+                .maybe_single()
+                .execute()
+            )
+            assignee_handle = (assignee_user.data or {}).get("github_handle")
+
+        url = create_github_issue(task, assignee_handle)
+        if url and not str(url).startswith("ERROR"):
+            created += 1
+        else:
+            failed += 1
+            failed_details.append({
+                "task_id": task.get("id"),
+                "description": task.get("description", "Untitled task"),
+                "error": str(url or "Unknown GitHub error"),
+            })
+
+    sync_github_issue_statuses(get_all_tasks_for_manager(), notify=False)
+    return {"success": True, "created": created, "failed": failed, "failed_details": failed_details}
+
+
+@app.post("/api/tasks/developer/{user_id}/github-sync-all")
+async def github_sync_all_for_developer(user_id: str, user=Depends(get_current_user)):
+    if user.get("role") != "manager" and user.get("id") != user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    db = get_db()
+    tasks = get_tasks_for_developer(user_id)
+    created = 0
+    failed = 0
+    failed_details = []
+
+    assignee_user = (
+        db.table("users")
+        .select("github_handle")
+        .eq("id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    assignee_handle = (assignee_user.data or {}).get("github_handle")
+
+    for task in tasks:
+        if task.get("status") in ("rejected", "pending_review"):
+            continue
+        if task.get("github_issue_url"):
+            continue
+
+        url = create_github_issue(task, assignee_handle)
+        if url and not str(url).startswith("ERROR"):
+            created += 1
+        else:
+            failed += 1
+            failed_details.append({
+                "task_id": task.get("id"),
+                "description": task.get("description", "Untitled task"),
+                "error": str(url or "Unknown GitHub error"),
+            })
+
+    sync_github_issue_statuses(get_all_tasks_for_manager(), notify=False)
+    return {"success": True, "created": created, "failed": failed, "failed_details": failed_details}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

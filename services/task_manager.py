@@ -104,11 +104,16 @@ def get_pending_tasks() -> list[dict]:
     return _flatten_joins(result.data or [])
 
 
-def get_all_tasks_for_manager(status_filter: list[str] | None = None) -> list[dict]:
+def get_all_tasks_for_manager(
+    status_filter: list[str] | None = None,
+    meeting_id: str | None = None,
+) -> list[dict]:
     db = get_db()
     q = db.table("tasks").select("*, meetings(title, attendees), users(username)")
     if status_filter:
         q = q.in_("status", status_filter)
+    if meeting_id:
+        q = q.eq("meeting_id", meeting_id)
     result = q.order("created_at", desc=True).execute()
     return _flatten_joins(result.data or [])
 
@@ -164,6 +169,55 @@ def get_stats_for_developer(user_id: str) -> dict:
     done        = sum(1 for t in tasks if t["status"] == "done")
     high        = sum(1 for t in tasks if t["priority"] == "high")
     return dict(total=total, todo=todo, in_progress=in_progress, done=done, high=high)
+
+
+def get_leaderboard_matrix() -> list[dict]:
+    """Cross-team developer leaderboard used by manager and developer dashboards."""
+    db = get_db()
+    dev_result = (
+        db.table("users")
+        .select("id, username")
+        .eq("role", "developer")
+        .order("username")
+        .execute()
+    )
+    developers = dev_result.data or []
+    all_tasks = get_all_tasks_for_manager()
+
+    rows = []
+    for dev in developers:
+        dev_id = dev["id"]
+        dev_tasks = []
+
+        for task in all_tasks:
+            assignees = task.get("assignees_list") or []
+            assigned_to = task.get("assigned_to")
+            if dev_id in assignees or assigned_to == dev_id:
+                dev_tasks.append(task)
+
+        total = len(dev_tasks)
+        completed = sum(1 for t in dev_tasks if t.get("status") == "done")
+        github_linked = sum(1 for t in dev_tasks if t.get("github_issue_url"))
+        completion_rate = (completed / total) * 100 if total else 0
+        avg_confidence = (
+            sum((float(t.get("confidence") or 50) for t in dev_tasks)) / total
+            if total else 0
+        )
+        overall_score = (completion_rate * 0.5) + (github_linked * 5) + (avg_confidence * 0.2)
+
+        rows.append({
+            "developer": dev.get("username", "Unknown"),
+            "developer_id": dev_id,
+            "total": total,
+            "completed": completed,
+            "completion_rate": completion_rate,
+            "github_linked": github_linked,
+            "avg_confidence": avg_confidence,
+            "overall_score": overall_score,
+        })
+
+    rows.sort(key=lambda x: x["overall_score"], reverse=True)
+    return rows
 
 
 # ── Writes ───────────────────────────────────────────────────────────

@@ -1,7 +1,6 @@
 import os
 from github import Github          # pip install PyGithub
 from services.task_manager import manager_update_task
-import streamlit as st
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME    = os.getenv("GITHUB_REPO")   # e.g. "your-org/your-repo"
@@ -49,7 +48,7 @@ def create_github_issue(task: dict, assignee_github_handle: str = None):
             return "ERR_MISSING_COLUMN"
         return f"ERROR (DB): {str(e)}"
 
-def sync_github_issue_statuses(tasks: list[dict]):
+def sync_github_issue_statuses(tasks: list[dict], notify: bool = False):
     """
     Check GitHub for 'closed' status and update automated tasks to 'done'.
     """
@@ -74,7 +73,12 @@ def sync_github_issue_statuses(tasks: list[dict]):
                 
                 if issue.state == "closed":
                     manager_update_task(task["id"], {"status": "done"})
-                    st.toast(f"✅ GitHub Issue #{issue_number} was resolved! Task updated to DONE.", icon="🐙")
+                    if notify:
+                        try:
+                            import streamlit as st
+                            st.toast(f"✅ GitHub Issue #{issue_number} was resolved! Task updated to DONE.", icon="🐙")
+                        except Exception:
+                            pass
             except Exception as e:
                 print(f"Failed to sync issue {url}: {e}")
                 

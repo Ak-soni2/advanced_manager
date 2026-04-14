@@ -46,6 +46,8 @@ class HelpService:
         self.agent = agent_service
 
     def get_response(self, question: str, mode: str = "question", user: dict | None = None) -> str:
+        role = (user or {}).get("role", "developer")
+
         if mode == "command" and self.agent:
             try:
                 return self.agent.invoke(question)
@@ -57,6 +59,10 @@ class HelpService:
             try:
                 prompt = (
                     f"You are a helpful assistant for the Automated Task Manager app.\n\n"
+                    f"CURRENT USER ROLE: {role}\n"
+                    "You must obey role boundaries. Managers can review/reject/assign all tasks. "
+                    "Developers can only see and work on their own assigned tasks. "
+                    "Never provide manager-only queue data to developers.\n\n"
                     f"Use the following documentation to answer the user's question.\n\n"
                     f"DOCUMENTATION:\n{KNOWLEDGE_BASE}\n\n"
                     f"USER QUESTION: {question}\n\n"
@@ -68,10 +74,20 @@ class HelpService:
                 pass
 
         # Fallback: keyword-based from knowledge base
-        return self._kb_lookup(question)
+        return self._kb_lookup(question, role)
 
-    def _kb_lookup(self, question: str) -> str:
+    def _kb_lookup(self, question: str, role: str = "developer") -> str:
         q = question.lower()
+        if any(w in q for w in ["reject", "rejection", "pending review"]):
+            if role == "manager":
+                return (
+                    "Managers can reject tasks from the Pending Review queue. "
+                    "Use the manager dashboard Pending Review tab to reject tasks."
+                )
+            return (
+                "Task rejection is manager-only. As a developer, you can update your own task status and notes, "
+                "but you cannot reject tasks or view pending-review queue items."
+            )
         if any(w in q for w in ["confidence", "score", "percent"]):
             return (
                 "Confidence scores show how certain the AI is:\n"

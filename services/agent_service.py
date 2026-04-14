@@ -12,6 +12,7 @@ orchestration layer built ON TOP of LangChain.
 """
 
 import os, asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -50,8 +51,11 @@ class AgentService:
     That keeps the human-in-the-loop guarantee intact.
     """
 
-    def __init__(self):
+    def __init__(self, user: Optional[dict] = None):
         self._agent = None  # lazy init
+        self._user = user or {}
+        self._role = (self._user.get("role") or "developer").lower()
+        self._user_id = self._user.get("id")
 
     def _get_agent(self):
         if self._agent is not None:
@@ -60,19 +64,33 @@ class AgentService:
         llm   = _build_llm()
         tools = self._build_tools()
 
-        system_prompt = (
-            "You are a helpful assistant for the Automated Task Manager app. "
-            "Use the provided tools to answer questions about tasks and meetings. "
-            "Always use tools to fetch real data — never make up task details. "
-            "For write operations (assigning, rejecting, editing tasks), politely "
-            "tell the user to use the manager dashboard directly."
-        )
+        if self._role == "manager":
+            system_prompt = (
+                "You are the MANAGER assistant for the Automated Task Manager app. "
+                "Use tools for live data and never invent records. "
+                "You can summarize pending-review tasks that a manager can reject. "
+                "For write operations, direct the user to the manager dashboard."
+            )
+        else:
+            system_prompt = (
+                "You are the DEVELOPER assistant for the Automated Task Manager app. "
+                "You must only discuss the current developer's own tasks and stats. "
+                "Do not reveal manager-only data such as pending-review queue, unassigned tasks, or other developers' workloads. "
+                "If asked manager-only actions (reject/assign/review queue), clearly say that action is manager-only. "
+                "Always use tools for live data and never invent records."
+            )
         self._agent = create_react_agent(llm, tools, prompt=system_prompt)
         return self._agent
 
     # ── Tools (mirrors repo tool pattern with @tool decorator) ───────
 
     def _build_tools(self):
+
+        if self._role != "manager":
+            return self._build_developer_tools()
+        return self._build_manager_tools()
+
+    def _build_manager_tools(self):
 
         @tool
         def list_all_tasks(status: str = "all") -> str:
@@ -179,6 +197,90 @@ class AgentService:
             list_meetings,
         ]
 
+    def _build_developer_tools(self):
+
+        @tool
+        def list_my_tasks(status: str = "all") -> str:
+            """
+            List only the current developer's tasks.
+            status: 'all' | 'confirmed' | 'in_progress' | 'done'
+            """
+            from services.task_manager import get_tasks_for_developer
+
+            if not self._user_id:
+                return "Unable to identify current developer session."
+
+            tasks = get_tasks_for_developer(self._user_id)
+            if status != "all":
+                tasks = [t for t in tasks if t.get("status") == status]
+
+            if not tasks:
+                return f"No tasks found for your account with status '{status}'."
+
+            lines = [f"Found {len(tasks)} of your tasks:\n"]
+            for i, t in enumerate(tasks, 1):
+                lines.append(
+                    f"{i}. [{t['status'].upper()}] {t['description'][:80]}\n"
+                    f"   Priority: {t['priority']} | Deadline: {t.get('deadline') or 'None'}\n"
+                    f"   Meeting: {t['meeting_title']}\n"
+                )
+            return "\n".join(lines)
+
+        @tool
+        def get_my_task_stats() -> str:
+            """Get stats for the current developer only."""
+            from services.task_manager import get_stats_for_developer
+
+            if not self._user_id:
+                return "Unable to identify current developer session."
+
+            s = get_stats_for_developer(self._user_id)
+            return (
+                "Your task statistics:\n"
+                f"  Total: {s['total']}\n"
+                f"  To do: {s['todo']}\n"
+                f"  In progress: {s['in_progress']}\n"
+                f"  Done: {s['done']}\n"
+                f"  High priority: {s['high']}\n"
+            )
+
+        @tool
+        def list_my_tasks_by_priority(priority: str) -> str:
+            """List current developer tasks filtered by priority: high | medium | low."""
+            from services.task_manager import get_tasks_for_developer
+
+            if not self._user_id:
+                return "Unable to identify current developer session."
+
+            tasks = [
+                t for t in get_tasks_for_developer(self._user_id)
+                if t.get("priority") == priority
+            ]
+            if not tasks:
+                return f"You have no {priority} priority tasks."
+
+            lines = [f"You have {len(tasks)} {priority} priority tasks:\n"]
+            for i, t in enumerate(tasks, 1):
+                lines.append(
+                    f"{i}. [{t['status']}] {t['description'][:80]}"
+                )
+            return "\n".join(lines)
+
+        @tool
+        def explain_rejection_permissions() -> str:
+            """Explain rejection permissions for developers."""
+            return (
+                "Task rejection is manager-only in this system. "
+                "Developers cannot reject tasks or access pending-review queue."
+            )
+
+        return [
+            list_my_tasks,
+            get_my_task_stats,
+            list_my_tasks_by_priority,
+            explain_rejection_permissions,
+        ]
+
     # ── Async invoke (mirrors repo process_request pattern) ──────────
 
     async def _invoke(self, user_input: str) -> str:
@@ -193,13 +295,26 @@ class AgentService:
                 return msg.content
         return "I couldn't find an answer to that."
 
+    async def ainvoke(self, user_input: str) -> str:
+        """Async entrypoint for async servers like FastAPI."""
+        return await self._invoke(user_input)
+
     def invoke(self, user_input: str) -> str:
         """Sync wrapper for Streamlit compatibility (from repo process_request_sync)."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(self._invoke(user_input))
+            # No running loop: safe to execute directly.
+            asyncio.get_running_loop()
+            has_running_loop = True
+        except RuntimeError:
+            has_running_loop = False
+
+        try:
+            if not has_running_loop:
+                return asyncio.run(self._invoke(user_input))
+
+            # Running loop detected (e.g., FastAPI): run coroutine in a worker thread.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(lambda: asyncio.run(self._invoke(user_input)))
+                return future.result()
         except Exception as e:
             return f"Agent error: {e}"
-        finally:
-            loop.close()

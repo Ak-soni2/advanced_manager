@@ -8,8 +8,8 @@ from views import manager_dashboard, developer_dashboard
 load_dotenv()
 
 st.set_page_config(
-    page_title="Automated Task Manager",
-    page_icon="🎤",
+    page_title="Automated Task Manager Manager OS",
+    page_icon="🟠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -40,6 +40,9 @@ user = require_login()
 
 # ── Sidebar ──────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown("## 🟠 Automated Task Manager")
+    st.caption("Delivery Intelligence")
+    st.divider()
     st.markdown(f"### 👤 {user['username']}")
     st.caption(f"Role: **{user['role'].capitalize()}**")
     st.divider()
